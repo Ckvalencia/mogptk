@@ -676,28 +676,48 @@ class DataSet:
         Examples:
             >>> fig, axes = dataset.plot(title='Title')
         """
+        import matplotlib.pyplot as plt
+
         if figsize is None:
-            figsize = (12,4*len(self.channels))
+            figsize = (12, 4 * len(self.channels))
 
         h = figsize[1]
-        fig, axes = plt.subplots(self.get_output_dims(), 1, figsize=figsize, squeeze=False, constrained_layout=True)
+        fig, axes = plt.subplots(
+            self.get_output_dims(), 1,
+            figsize=figsize, squeeze=False, constrained_layout=True
+        )
 
         legends = {}
         for channel in range(self.get_output_dims()):
-            self.channels[channel].plot(pred=pred, ax=axes[channel,0], transformed=transformed)
-            l = axes[channel,0].get_legend()
-            for text, handle in zip(l.texts, l.legendHandles):
+            self.channels[channel].plot(pred=pred, ax=axes[channel, 0], transformed=transformed)
+            l = axes[channel, 0].get_legend()
+
+            if l is None:
+                continue  # En caso de que no haya leyenda
+
+            #  Compatibilidad con Matplotlib nuevas y antiguas
+            handles = getattr(l, "legendHandles", None)
+            if handles is None:
+                handles = l.get_lines()
+
+            texts = getattr(l, "texts", None)
+            if texts is None:
+                texts = l.get_texts()
+
+            for text, handle in zip(texts, handles):
                 if text.get_text() == "Observations":
                     handle = plt.Line2D([0], [0], ls='', color='r', marker='.', ms=10, label='Observations')
                 legends[text.get_text()] = handle
+
             l.remove()
 
-        legend_rows = (len(legends)-1)/5 + 1
+        legend_rows = (len(legends) - 1) / 5 + 1
         if title is not None:
-            fig.suptitle(title, y=(h+0.2+0.4*legend_rows)/h, fontsize=18)
+            fig.suptitle(title, y=(h + 0.2 + 0.4 * legend_rows) / h, fontsize=18)
 
         if legend:
             fig.legend(handles=legends.values(), ncol=5)
+
         return fig, axes
 
     def plot_spectrum(self, title=None, method='ls', per=None, maxfreq=None, figsize=None, log=False, transformed=True, n=1001):
@@ -738,3 +758,180 @@ class DataSet:
         for channel in range(self.get_output_dims()):
             self.channels[channel].plot_spectrum(method=method[channel], ax=axes[channel,0], per=per[channel], maxfreq=maxfreq[channel], log=log, transformed=transformed, n=n)
         return fig, axes
+
+
+def plot_latent(self, pred=None, title=None, figsize=None, legend=True, transformed=False, latent_names=None):
+    """
+    Plot data for multi-latent likelihoods without replicating observations.
+
+    Shows:
+    - Observations once (not replicated across channels)
+    - Each latent function in separate subplots
+    - Predictions if available
+
+    Args:
+        pred (str): Specify model name to draw predictions.
+        title (str): Set the title of the plot.
+        figsize (tuple): Set the figure size.
+        legend (boolean): Show legend.
+        transformed (boolean): Display transformed Y data.
+        latent_names (list): Names for each latent function (e.g., ['Mean (f)', 'Log-Variance (g)']).
+
+    Returns:
+        matplotlib.figure.Figure: The figure.
+        list of matplotlib.axes.Axes: List of axes.
+
+    Examples:
+        >>> fig, axes = dataset.plot_latent(
+        ...     pred='model_name',
+        ...     latent_names=['Mean', 'Log-Variance']
+        ... )
+    """
+    import matplotlib.pyplot as plt
+
+    # Detectar número de latentes
+    # Asumimos que la información está en el likelihood del modelo
+    if pred is not None and pred in self.models:
+        model = self.models[pred]
+        if hasattr(model.likelihood, 'latent_dims'):
+            Q = model.likelihood.latent_dims
+        else:
+            raise ValueError("El modelo no tiene un likelihood multi-latente")
+    else:
+        # Si no hay predicción, intentar detectar de los canales
+        Q = self.get_output_dims()
+
+    # Calcular N (puntos reales)
+    total_points = self.channels[0].X.shape[0]
+    N = total_points // Q
+
+    # Nombres por defecto para latentes
+    if latent_names is None:
+        latent_names = [f'Latent {i}' for i in range(Q)]
+
+    if len(latent_names) != Q:
+        raise ValueError(f"latent_names debe tener {Q} elementos")
+
+    # Configurar figura: 1 subplot para observaciones + Q subplots para latentes
+    if figsize is None:
+        figsize = (12, 3 * (Q + 1))
+
+    fig, axes = plt.subplots(
+        Q + 1, 1,
+        figsize=figsize,
+        squeeze=False,
+        constrained_layout=True
+    )
+
+    # ===== Subplot 0: Observaciones reales =====
+    ax_obs = axes[0, 0]
+
+    # Extraer solo los primeros N puntos (observaciones reales, no replicadas)
+    X_real = self.channels[0].X[:N]
+    Y_real = self.channels[0].Y[:N]
+    Y_mask_real = self.channels[0].Y_mask[:N]
+
+    # Graficar observaciones
+    if transformed and hasattr(self.channels[0], 'Y_transformer'):
+        Y_plot = self.channels[0].Y_transformer.forward(Y_real, X_real)
+    else:
+        Y_plot = Y_real
+
+    # Puntos observados
+    observed = ~Y_mask_real
+    ax_obs.plot(
+        X_real[observed],
+        Y_plot[observed],
+        'r.',
+        ms=8,
+        label='Observations'
+    )
+
+    # Puntos removidos
+    removed = Y_mask_real
+    if removed.any():
+        ax_obs.plot(
+            X_real[removed],
+            Y_plot[removed],
+            'k.',
+            ms=5,
+            alpha=0.3,
+            label='Removed'
+        )
+
+    ax_obs.set_ylabel('y', fontsize=14)
+    ax_obs.set_title('Observations (Real Data)', fontsize=14, fontweight='bold')
+    ax_obs.grid(True, alpha=0.3)
+
+    # ===== Subplots 1 a Q: Funciones latentes =====
+    legends = {}
+
+    for q in range(Q):
+        ax_latent = axes[q + 1, 0]
+
+        # Extraer datos del canal q
+        # Los datos están organizados como: [f_0, f_1, ..., f_{N-1}, g_0, g_1, ..., g_{N-1}]
+        # El canal q contiene los puntos desde q*N hasta (q+1)*N
+        channel_idx = q
+        X_latent = self.channels[channel_idx].X[q * N:(q + 1) * N]
+
+        # Graficar predicciones si están disponibles
+        if pred is not None and pred in self.channels[channel_idx].predictions:
+            prediction = self.channels[channel_idx].predictions[pred]
+
+            # Media predictiva
+            mu = prediction['mu'][q * N:(q + 1) * N]
+
+            if transformed and hasattr(self.channels[channel_idx], 'Y_transformer'):
+                mu = self.channels[channel_idx].Y_transformer.forward(mu, X_latent)
+
+            line, = ax_latent.plot(
+                X_latent,
+                mu,
+                'b-',
+                linewidth=2,
+                label=f'{latent_names[q]} (Posterior Mean)'
+            )
+            legends[f'{latent_names[q]} Mean'] = line
+
+            # Intervalo de confianza
+            if 'lower' in prediction and 'upper' in prediction:
+                lower = prediction['lower'][q * N:(q + 1) * N]
+                upper = prediction['upper'][q * N:(q + 1) * N]
+
+                if transformed and hasattr(self.channels[channel_idx], 'Y_transformer'):
+                    lower = self.channels[channel_idx].Y_transformer.forward(lower, X_latent)
+                    upper = self.channels[channel_idx].Y_transformer.forward(upper, X_latent)
+
+                fill = ax_latent.fill_between(
+                    X_latent.flatten(),
+                    lower.flatten(),
+                    upper.flatten(),
+                    alpha=0.2,
+                    color='b',
+                    label='95% CI'
+                )
+                if q == 0:  # Solo agregar una vez a la leyenda
+                    legends['95% CI'] = fill
+
+        ax_latent.set_ylabel(latent_names[q], fontsize=14)
+        ax_latent.set_title(f'Latent Function: {latent_names[q]}', fontsize=14, fontweight='bold')
+        ax_latent.grid(True, alpha=0.3)
+
+        if q == Q - 1:  # Último subplot
+            ax_latent.set_xlabel('X', fontsize=14)
+
+    # Agregar leyenda de observaciones
+    obs_legend = plt.Line2D([0], [0], ls='', color='r', marker='.', ms=10, label='Observations')
+    legends['Observations'] = obs_legend
+
+    # Título general
+    if title is not None:
+        fig.suptitle(title, fontsize=18, fontweight='bold')
+
+    # Leyenda global
+    if legend and len(legends) > 0:
+        fig.legend(handles=legends.values(), loc='upper center', ncol=min(5, len(legends)),
+                   bbox_to_anchor=(0.5, 1.0), frameon=True)
+
+    return fig, axes

@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import torch.nn.functional as F
 from . import config, Parameter
 
 def identity(x):
@@ -309,6 +310,300 @@ class MultiOutputLikelihood(Likelihood):
             res[r[i],:], lower[r[i],:], upper[r[i],:] = self.likelihoods[i].predict(X, mu[r[i],:], var[r[i],:], ci=ci, sigma=sigma, n=n)
         return res, lower, upper  # Nx1
 
+class MultiLatentLikelihood(Likelihood):
+    """
+    Multi-latent likelihood wrapper.
+
+    A single likelihood whose parameters are modeled by multiple latent functions.
+
+    Example:
+        Heteroscedastic Gaussian:
+            f[:,0] -> mean
+            f[:,1] -> log variance
+    """
+    def __init__(self, likelihood, mc_samples=10):
+        super().__init__()
+
+        if not issubclass(type(likelihood), Likelihood):
+            raise ValueError("likelihood must be an instance of Likelihood")
+
+        if isinstance(likelihood, MultiOutputLikelihood):
+            raise ValueError("MultiLatentLikelihood wraps a single likelihood only")
+
+        self.likelihood = likelihood
+        # Obtener latent_dims del likelihood específico
+        if not hasattr(likelihood, 'latent_dims'):
+            raise ValueError("El likelihood debe definir el atributo 'latent_dims'")
+
+        self.latent_dims = likelihood.latent_dims
+        self.output_dims = self.latent_dims
+        if self.latent_dims <= 0:
+            raise ValueError("latent_dims debe ser positivo")
+
+        self.has_closed_form = getattr(likelihood, 'has_closed_form', False)
+        self.mc_samples = mc_samples
+    def name(self):
+        return f"MultiLatent[{self.likelihood.name()}, Q={self.latent_dims}]"
+
+    def validate_y(self, X, y):
+        """
+        Validate observations.
+        """
+        # Calcular N (número de puntos reales)
+        total_points = X.shape[0]
+        N = total_points // self.latent_dims
+
+        # Solo validar los primeros N puntos
+        y_real = y[:N, :]
+        self.likelihood.validate_y(X, y_real)
+
+    def _reshape_mogptk_to_latent(self, X, tensor):
+        """
+        Convierte de formato mogptk (N*Q, 1) a formato latent (N, Q)
+        """
+        total_points = tensor.shape[0]  # N*Q (ejemplo: 400)
+        N = total_points // self.latent_dims  # N (ejemplo: 200)
+        Q = self.latent_dims  # Q (ejemplo: 2)
+
+
+        # Reshape: (N*Q, 1) -> (N*Q,) -> (Q, N) -> (N, Q)
+        tensor_flat = tensor.squeeze(-1)  # (400,)
+
+        tensor_reshaped = tensor_flat.reshape(Q, N).T  # (2, 200) -> (200, 2)
+
+        return tensor_reshaped
+
+    def _reshape_latent_to_mogptk(self, X, tensor):
+        """
+        Convierte de formato latent (N, Q) o (N,) a formato mogptk (N*Q, 1)
+
+        Ejemplo: [[f0,g0], [f1,g1], ..., [f199,g199]] -> [f0, f1, ..., f199, g0, g1, ..., g199]
+        """
+        if tensor.ndim == 1:
+            # Si tensor es (N,), replicar para todos los canales
+            N = tensor.shape[0]
+            Q = self.latent_dims
+            tensor_expanded = tensor.unsqueeze(-1).expand(N, Q)  # (N, Q)
+            tensor_flat = tensor_expanded.T.reshape(-1, 1)  # (N*Q, 1)
+        else:
+            # Si tensor es (N, Q)
+            N, Q = tensor.shape
+            tensor_flat = tensor.T.reshape(-1, 1)  # (Q, N) -> (N*Q, 1)
+
+        return tensor_flat
+
+    def log_prob(self, X, y, f):
+        """
+        Args:
+            X : inputs
+            y : observations, shape (N, 1)
+            f : latent functions, shape (N*Q, 1)
+
+        Returns:
+            log p(y | f1, ..., fQ)
+        """
+       # if f.ndim != 2:
+       #     raise ValueError("f must be a 2D tensor (N, Q)")
+
+        #if f.shape[1] != self.latent_dims:
+        #   raise ValueError(
+        #        f"Expected {self.latent_dims} latent functions, got {f.shape[1]}"
+        #    )
+        # Convertir f de (N*Q, 1) a (N, Q)
+        f_reshaped = self._reshape_mogptk_to_latent(X, f)
+
+        # Obtener y real (solo primer canal)
+        r = self._channel_indices(X)
+        y_real = y[r[0], :]
+
+        # Calcular log_prob - resultado es (N,) o (N, 1)
+        logp = self.likelihood.log_prob(X, y_real, f_reshaped)
+
+        if logp.ndim == 1:
+            logp = logp.unsqueeze(-1)
+
+        # Convertir de (N, 1) a (N*Q, 1) - replicar para todos los canales
+        return self._reshape_latent_to_mogptk(X, logp.squeeze(-1))
+
+    def variational_expectation(self, X, y, mu, var):
+        """
+        Args:
+            X : inputs, shape (N*Q, input_dims)
+            y : observations, shape (N*Q, 1)
+            mu : mean, shape (N*Q, 1)
+            var : variance, shape (N*Q, 1)
+
+        Returns:
+            scalar: E_q[log p(y | f)]
+        """
+
+
+        # Convertir de (N*Q, 1) a (N, Q)
+        mu_reshaped = self._reshape_mogptk_to_latent(X, mu)
+        var_reshaped = self._reshape_mogptk_to_latent(X, var)
+
+        # Obtener y real (primeros N puntos)
+        N = mu_reshaped.shape[0]
+        Q = self.latent_dims
+        y_real = y[:N, :]
+
+
+        if self.has_closed_form:
+            return self.likelihood.variational_expectation(X, y_real, mu_reshaped, var_reshaped )
+
+        S = self.mc_samples
+
+        # Reparametrización
+        eps = torch.randn(S, N, Q, device=mu_reshaped.device, dtype=mu_reshaped.dtype)
+
+        f_samples = mu_reshaped.unsqueeze(0) + eps * torch.sqrt(var_reshaped).unsqueeze(0)
+
+        # Calcular log p(y | f) para cada muestra
+        logp_sum = 0.0
+        for s in range(S):
+            logp_s = self.likelihood.log_prob(X, y_real, f_samples[s])
+            logp_sum += logp_s.sum()
+
+        # Promedio Monte Carlo
+        return logp_sum / S
+
+    def conditional_mean(self, X, f):
+        """
+        Media condicional E[y | f1, ..., fQ]
+
+        Args:
+            X: inputs, shape (N*Q, input_dims)
+            f: funciones latentes, shape (N*Q, n_cols)
+                n_cols puede ser 1 (normal) o deg (cuadratura)
+
+        Returns:
+            mean: E[y | f], shape (N*Q, n_cols)
+        """
+        # Guardar shape original
+        n_cols = f.shape[1] if f.ndim == 2 else 1
+        if n_cols == 1 and f.ndim == 1:
+            f = f.unsqueeze(-1)
+
+        # Calcular dimensiones
+        N = f.shape[0] // self.latent_dims
+        Q = self.latent_dims
+
+        # Procesar cada columna (punto de cuadratura) por separado
+        means_list = []
+        for col_idx in range(n_cols):
+            # Extraer columna
+            f_col = f[:, col_idx:col_idx + 1]  # (N*Q, 1)
+
+            # Reshape: (N*Q, 1) -> (N, Q)
+            f_col_flat = f_col.squeeze(-1)  # (N*Q,)
+            f_reshaped = f_col_flat.reshape(Q, N).T  # (N, Q)
+
+            # Llamar likelihood interno
+            mean_col = self.likelihood.conditional_mean(X, f_reshaped)  # (N, 1)
+
+            # Reshape de vuelta: (N, 1) -> (N*Q, 1)
+            mean_col_flat = mean_col.squeeze(-1)  # (N,)
+            mean_col_expanded = mean_col_flat.unsqueeze(-1).expand(N, Q)  # (N, Q)
+            mean_col_mogptk = mean_col_expanded.T.reshape(-1, 1)  # (N*Q, 1)
+
+            means_list.append(mean_col_mogptk)
+
+        # Concatenar columnas
+        result = torch.cat(means_list, dim=1)  # (N*Q, n_cols)
+
+        return result
+
+    def conditional_sample(self, X, f):
+        """
+        Muestrea y ~ p(y | f1, ..., fQ)
+
+        Args:
+            X: inputs, shape (N*Q, input_dims)
+            f: funciones latentes, shape (N*Q, n_cols)
+
+        Returns:
+            sample: muestra de y, shape (N*Q, n_cols)
+        """
+        # Guardar shape original
+        n_cols = f.shape[1] if f.ndim == 2 else 1
+        if n_cols == 1 and f.ndim == 1:
+            f = f.unsqueeze(-1)
+
+        # Calcular dimensiones
+        N = f.shape[0] // self.latent_dims
+        Q = self.latent_dims
+
+        # Procesar cada columna por separado
+        samples_list = []
+        for col_idx in range(n_cols):
+            # Extraer columna
+            f_col = f[:, col_idx:col_idx + 1]  # (N*Q, 1)
+
+            # Reshape: (N*Q, 1) -> (N, Q)
+            f_col_flat = f_col.squeeze(-1)  # (N*Q,)
+            f_reshaped = f_col_flat.reshape(Q, N).T  # (N, Q)
+
+            # Llamar likelihood interno
+            sample_col = self.likelihood.conditional_sample(X, f_reshaped)  # (N, 1)
+
+            # Reshape de vuelta: (N, 1) -> (N*Q, 1)
+            sample_col_flat = sample_col.squeeze(-1)  # (N,)
+            sample_col_expanded = sample_col_flat.unsqueeze(-1).expand(N, Q)  # (N, Q)
+            sample_col_mogptk = sample_col_expanded.T.reshape(-1, 1)  # (N*Q, 1)
+
+            samples_list.append(sample_col_mogptk)
+
+        # Concatenar columnas
+        result = torch.cat(samples_list, dim=1)  # (N*Q, n_cols)
+
+        return result
+
+    def predict(self, X, mu, var, ci=None, sigma=None, n=10000):
+        """
+        Wrapper genérico para predict.
+
+        Delega al likelihood interno, manejando solo la conversión de shapes.
+
+        Args:
+            X: inputs, shape (N*Q, input_dims)
+            mu: media posterior, shape (N*Q, 1)
+            var: varianza posterior, shape (N*Q, 1)
+            ci: intervalo de confianza
+            sigma: número de desviaciones estándar
+            n: número de muestras
+
+        Returns:
+            mean: shape (N*Q, 1)
+            lower: shape (N*Q, 1) (opcional)
+            upper: shape (N*Q, 1) (opcional)
+        """
+        # Convertir de (N*Q, 1) a (N, Q)
+        mu_reshaped = self._reshape_mogptk_to_latent(X, mu)
+        var_reshaped = self._reshape_mogptk_to_latent(X, var)
+
+        # Llamar al método predict del likelihood interno
+        result = self.likelihood.predict(X, mu_reshaped, var_reshaped, ci=ci, sigma=sigma, n=n)
+
+        # Manejar diferentes formatos de retorno
+        if isinstance(result, tuple):
+            # Retorna (mean, lower, upper)
+            pred_mean, lower, upper = result
+
+            # Convertir cada uno de (N, 1) a (N*Q, 1)
+            mean_mogptk = self._reshape_latent_to_mogptk(X, pred_mean.squeeze(-1))
+            lower_mogptk = self._reshape_latent_to_mogptk(X, lower.squeeze(-1))
+            upper_mogptk = self._reshape_latent_to_mogptk(X, upper.squeeze(-1))
+
+            return mean_mogptk, lower_mogptk, upper_mogptk
+        else:
+            # Solo retorna mean
+            pred_mean = result
+
+            # Convertir de (N, 1) a (N*Q, 1)
+            mean_mogptk = self._reshape_latent_to_mogptk(X, pred_mean.squeeze(-1))
+
+            return mean_mogptk
+
 class GaussianLikelihood(Likelihood):
     """
     Gaussian likelihood given by
@@ -376,6 +671,198 @@ class GaussianLikelihood(Likelihood):
             lower = mu - sigma*var.sqrt()
             upper = mu + sigma*var.sqrt()
         return mu, lower, upper
+
+
+
+class GaussianHeteroLikelihood(Likelihood):
+    """
+    Gaussian heteroscedastic likelihood:
+        y | f, g ~ N(f, exp(g))
+
+    Latent dimensions:
+        f[:,0] -> mean
+        f[:,1] -> log-variance
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.latent_dims = 2
+        self.has_closed_form_ve = True
+
+    def safe_exp(self, x):
+        """
+        Exponencial segura para evitar overflow.
+        """
+        UPPER_LIM = torch.log(torch.tensor(705.0, device=x.device, dtype=x.dtype))
+        x_clipped = torch.clamp(x, -UPPER_LIM, UPPER_LIM)
+        return torch.exp(x_clipped)
+
+    def log_prob(self, X, y, f):
+        """
+        Calcula log p(y | f, g)
+
+        Args:
+            X: inputs (no usado pero requerido por interfaz)
+            y: observaciones, shape (N, 1)
+            f: funciones latentes, shape (..., N, 2)
+                Puede ser (N, 2) o (S, N, 2) para muestras Monte Carlo
+
+        Returns:
+            log p(y|f,g), shape (..., N) o escalar
+        """
+        # Extraer f y g
+        F = f[..., 0]  # (..., N) - media
+        G = f[..., 1]  # (..., N) - log-varianza
+
+        # y puede ser (N, 1), convertir a (N,)
+        y_flat = y.squeeze(-1)  # (N,)
+
+        # Calcular log p(y | F, G)
+        # log p = -(1/2) * [log(2π) + G + (y - F)²/exp(G)]
+        var = self.safe_exp(G)
+        log_prob = -0.5 * (
+                torch.log(2 * torch.tensor(np.pi, device=y.device, dtype=y.dtype)) +
+                G +
+                (y_flat - F) ** 2 / var
+        )
+
+        return log_prob  # (..., N)
+
+    def variational_expectation(self, X, y, mu, var):
+        """
+        Calcula E_q[log p(y | f, g)] usando forma cerrada.
+
+        Args:
+            X: inputs (no usado)
+            y: observaciones, shape (N, 1)
+            mu: media posterior, shape (N, 2)
+                mu[:,0] = E[f]
+                mu[:,1] = E[g]
+            var: varianza posterior, shape (N, 2)
+                var[:,0] = Var[f]
+                var[:,1] = Var[g]
+
+        Returns:
+            E_q[log p(y|f,g)], escalar
+        """
+        # Extraer componentes
+        Fmu = mu[:, 0:1]  # (N, 1) - media de f
+        Gmu = mu[:, 1:2]  # (N, 1) - media de g
+        Fvar = var[:, 0:1]  # (N, 1) - varianza de f
+        Gvar = var[:, 1:2]  # (N, 1) - varianza de g
+
+        # Constantes
+        N = torch.tensor(y.shape[0], dtype=y.dtype, device=y.device)
+        π = torch.tensor(np.pi, dtype=y.dtype, device=y.device)
+
+        # Término de varianza usando la fórmula cerrada
+        # Gmu + exp(-Gmu + Gvar/2) * (Y² - 2Y*Fmu + Fvar + Fmu²)
+        exp_term = torch.exp(-Gmu + Gvar / 2)
+        var_term = Gmu + exp_term * (y ** 2 - 2 * y * Fmu + Fvar + Fmu ** 2)
+
+        # E_q[log p(y|f,g)] = -(1/2) * [N*log(2π) + sum(var_term)]
+        ve = -0.5 * (N * torch.log(2 * π) + var_term.sum())
+
+        return ve
+
+    def conditional_mean(self, X, f):
+        """
+        Media condicional: E[y | f, g] = f
+
+        Args:
+            X: inputs, shape (N, input_dims) - no usado pero requerido
+            f: funciones latentes, shape (N, 2)
+                f[:,0] = media
+                f[:,1] = log-varianza
+
+        Returns:
+            mean: E[y | f, g], shape (N, 1)
+        """
+        # La media condicional de y dado f,g es simplemente f (la componente de media)
+        # Ignoramos g (log-varianza) porque no afecta la media
+        return f[:, 0:1]  # (N, 1)
+
+    def conditional_sample(self, X, f):
+        """
+        Genera muestras de y | f, g
+
+        Args:
+            X: inputs
+            f: funciones latentes, shape (N, 2)
+
+        Returns:
+            samples, shape (N,)
+        """
+        F = f[:, 0]  # Media
+        G = f[:, 1]  # Log-varianza
+
+        var = self.safe_exp(G)
+        std = torch.sqrt(var)
+
+        # Muestrear de N(F, exp(G))
+        samples = torch.distributions.normal.Normal(F, std).sample()
+
+        return samples
+
+    def predict(self, X, mu, var, ci=None, sigma=None, n=10000):
+        """
+        Predicción usando forma cerrada para Gaussian heteroscedastic.
+
+        Args:
+            X: inputs, shape (N, input_dims)
+            mu: media posterior, shape (N, 2)
+                mu[:,0] = E[f]
+                mu[:,1] = E[g]
+            var: varianza posterior, shape (N, 2)
+                var[:,0] = Var[f]
+                var[:,1] = Var[g]
+            ci: intervalo de confianza [lower, upper]
+            sigma: número de desviaciones estándar
+            n: número de muestras (no usado, forma cerrada)
+
+        Returns:
+            mean: media predictiva, shape (N, 1)
+            lower: límite inferior (opcional), shape (N, 1)
+            upper: límite superior (opcional), shape (N, 1)
+        """
+        # Extraer componentes
+        Fmu = mu[:, 0:1]  # (N, 1) - E[f]
+        Gmu = mu[:, 1:2]  # (N, 1) - E[g]
+        Fvar = var[:, 0:1]  # (N, 1) - Var[f]
+        Gvar = var[:, 1:2]  # (N, 1) - Var[g]
+
+        # Media predictiva: E[y] = E[E[y|f,g]] = E[f]
+        pred_mean = Fmu  # (N, 1)
+
+        # Varianza predictiva: Var[y] = E[Var[y|f,g]] + Var[E[y|f,g]]
+        #                             = E[exp(g)] + Var[f]
+        # donde E[exp(g)] = exp(E[g] + Var[g]/2) por propiedad lognormal
+        expected_noise_var = torch.exp(Gmu + Gvar / 2)
+        pred_var = Fvar + expected_noise_var  # (N, 1)
+
+        if ci is None and sigma is None:
+            return pred_mean
+
+        # Calcular intervalos usando aproximación Gaussiana
+        pred_std = torch.sqrt(pred_var)
+
+        if sigma is not None:
+            # Usar número de desviaciones estándar
+            lower = pred_mean - sigma * pred_std
+            upper = pred_mean + sigma * pred_std
+        else:
+            # Usar cuantiles de la distribución normal
+            # Crear distribución normal
+            dist = torch.distributions.Normal(pred_mean, pred_std)
+
+            # Calcular cuantiles
+            lower_q = torch.tensor(ci[0], device=mu.device, dtype=mu.dtype)
+            upper_q = torch.tensor(ci[1], device=mu.device, dtype=mu.dtype)
+
+            lower = dist.icdf(lower_q)
+            upper = dist.icdf(upper_q)
+
+        return pred_mean, lower, upper
 
 class StudentTLikelihood(Likelihood):
     """
@@ -546,6 +1033,209 @@ class BernoulliLikelihood(Likelihood):
             return p
         return p, p, p
 
+class SoftmaxLikelihood(Likelihood):
+    """
+    Softmax likelihood para clasificación multiclase.
+
+    Para clasificación multiclase con K clases, usamos K funciones latentes f = [f_1, ..., f_K],
+    y la probabilidad de la clase k está dada por:
+
+    $$ p(y=k|f) = \\frac{\\exp(f_k)}{\\sum_{j=1}^K \\exp(f_j)} $$
+
+    Args:
+        num_classes (int): Número de clases K.
+        mc_samples (int): Número de muestras Monte Carlo para aproximar la expectativa variacional.
+
+    Attributes:
+        num_classes (int): Número de clases.
+        mc_samples (int): Número de muestras Monte Carlo.
+    """
+    def __init__(self, num_classes, mc_samples=100):
+        super().__init__(quadratures=20)
+        if num_classes is None or num_classes < 2:
+            raise ValueError("num_classes must be at least 2")
+        self.num_classes = int(num_classes)
+        self.mc_samples = int(mc_samples)
+        self.latent_dims = self.num_classes
+        self.output_dims = num_classes
+        self.has_closed_form_ve = False
+
+    def validate_y(self, X, y):
+        if y is None:
+            return
+        y_t = torch.as_tensor(y, dtype=torch.long)
+        y_flat = y_t.view(-1)
+        if not torch.all((y_flat >= 0) & (y_flat < self.num_classes)):
+            raise ValueError(f"y must contain integers in [0, {self.num_classes-1}], got min={y_flat.min()}, max={y_flat.max()}")
+
+    def log_prob(self, X, y, f):
+        """
+        Calcula log p(y|f) para cada punto de datos.
+
+        Args:
+            X: (N,D) - no usado directamente pero mantiene compatibilidad
+            y: (N,1) - índices de clase (valores entre 0 y K-1)
+            f: (N,Q) donde Q puede ser num_classes (para evaluación directa)
+                o cualquier número de muestras de quadratura
+
+        Returns:
+            torch.tensor: (N,Q) log probabilidades
+        """
+        # f puede venir en diferentes formas dependiendo del contexto
+        # Para softmax, esperamos que las últimas dimensiones sean las clases
+        y_idx = y.view(-1).long()
+        N = y_idx.shape[0]
+
+        if f.dim() == 2:
+            # f es (N, K) donde K = num_classes
+            if f.shape[1] != self.num_classes:
+                raise RuntimeError(f"Expected f.shape[1]={self.num_classes}, got {f.shape[1]}")
+            logp = F.log_softmax(f, dim=1)  # (N, K)
+            # Seleccionar log-prob de la clase observada
+            vals = logp[torch.arange(N, device=logp.device), y_idx]  # (N,)
+            return vals.view(N, 1)
+        else:
+            raise RuntimeError(f"SoftmaxLikelihood.log_prob: unexpected f.dim()={f.dim()}")
+
+    def conditional_mean(self, X, f):
+        """
+        Retorna las probabilidades de clase: p(y=k|f).
+
+        Args:
+            X: (N,D) - entrada
+            f: (N,K) - valores de funciones latentes
+
+        Returns:
+            torch.tensor: (N,K) probabilidades de clase
+        """
+        return F.softmax(f, dim=-1)
+
+    def conditional_sample(self, X, f):
+        """
+        Muestrea clases de la distribución categórica.
+
+        Args:
+            X: (N,D) - entrada
+            f: (n_samples, N, K) o (N,K) - valores de funciones latentes
+
+        Returns:
+            torch.tensor: índices de clase muestreados
+        """
+        if f.dim() == 3:
+            # f: (n_samples, N, K)
+            n_samples, N, K = f.shape
+            probs = F.softmax(f, dim=2)  # (n_samples, N, K)
+            samples = torch.zeros(n_samples, N, device=f.device, dtype=torch.long)
+            for i in range(n_samples):
+                samples[i] = torch.multinomial(probs[i], num_samples=1).view(-1)
+            return samples.float()
+        else:
+            # f: (N,K)
+            probs = F.softmax(f, dim=1)
+            return torch.multinomial(probs, num_samples=1).view(-1, 1).float()
+
+    def variational_expectation(self, X, y, mu, var):
+        """
+        Aproximación Monte Carlo de E_q[log p(y|f)] donde q(f) ~ N(mu, diag(var)).
+
+        Args:
+            X: (N,D) - entrada
+            y: (N,1) - índices de clase observados
+            mu: (N,K) - media de la distribución variacional
+            var: (N,K) - varianza diagonal de la distribución variacional
+
+        Returns:
+            torch.tensor: escalar - suma de expectativas variacional sobre todos los puntos
+        """
+        mu = torch.as_tensor(mu)
+        var = torch.as_tensor(var)
+        y_idx = y.view(-1).long()
+
+        N = mu.shape[0]
+        K = mu.shape[1] if mu.dim() == 2 else 1
+
+        if K != self.num_classes:
+            raise RuntimeError(f"Expected mu with K={self.num_classes} latent functions, got {K}")
+
+        # Muestreo Monte Carlo
+        S = self.mc_samples
+        device = mu.device
+        dtype = mu.dtype
+
+        # Clamping para estabilidad numérica
+        var = torch.clamp(var, min=1e-10)
+        sqrt_var = torch.sqrt(var)
+
+        # Muestras: (S, N, K)
+        eps = torch.randn(S, N, K, device=device, dtype=dtype)
+        f_samples = mu.unsqueeze(0) + eps * sqrt_var.unsqueeze(0)
+
+        # Log softmax: (S, N, K)
+        logp = F.log_softmax(f_samples, dim=2)
+
+        # Seleccionar log-prob de clases observadas: (S, N)
+        idx = torch.arange(N, device=device)
+        logp_obs = logp[:, idx, y_idx]
+
+        # Promedio sobre muestras y suma sobre datos
+        return logp_obs.mean(dim=0).sum()
+
+    def predict(self, X, mu, var, ci=None, sigma=None, n=10000):
+        """
+        Predice probabilidades de clase integrando sobre la distribución posterior.
+
+        Args:
+            X: (N,D) - puntos de entrada
+            mu: (N,K) - media posterior
+            var: (N,K) - varianza posterior diagonal
+            ci: [lower, upper] - percentiles para intervalo de confianza
+            sigma: no usado para softmax
+            n: número de muestras Monte Carlo
+
+        Returns:
+            Si ci es None: (N,K) - probabilidades de clase
+            Si ci especificado: ((N,K), (N,K), (N,K)) - media, lower, upper
+        """
+        mu = torch.as_tensor(mu)
+        var = torch.as_tensor(var)
+
+        if var is None or torch.all(var < 1e-8):
+            # Predicción determinística
+            p = F.softmax(mu, dim=-1)
+            if ci is None:
+                return p
+            return p, p, p
+
+        # Integración Monte Carlo
+        N, K = mu.shape
+        device = mu.device
+        dtype = mu.dtype
+
+        var = torch.clamp(var, min=1e-10)
+        sqrt_var = torch.sqrt(var)
+
+        # Muestras: (n, N, K)
+        eps = torch.randn(n, N, K, device=device, dtype=dtype)
+        f_samples = mu.unsqueeze(0) + eps * sqrt_var.unsqueeze(0)
+
+        # Probabilidades: (n, N, K)
+        probs = F.softmax(f_samples, dim=2)
+
+        # Media
+        p_mean = probs.mean(dim=0)
+
+        if ci is None:
+            return p_mean
+
+        # Cuantiles para intervalo de confianza
+        probs_sorted, _ = torch.sort(probs, dim=0)
+        lower_idx = int(ci[0] * n)
+        upper_idx = int(ci[1] * n)
+        lower = probs_sorted[lower_idx]
+        upper = probs_sorted[upper_idx]
+
+        return p_mean, lower, upper
+
 class BetaLikelihood(Likelihood):
     """
     Beta likelihood given by
@@ -602,7 +1292,7 @@ class GammaLikelihood(Likelihood):
 
     $$ p(y|f) = \\frac{1}{\\Gamma(k)h(f)^k} y^{k-1} e^{-y/h(f)} $$
 
-    with \\(h\\) the link function, \\(k\\) the shape, and \\(y \\in (0.0,\\infty)\\). 
+    with \\(h\\) the link function, \\(k\\) the shape, and \\(y \\in (0.0,\\infty)\\).
 
     Args:
         shape (float): Shape.
@@ -868,3 +1558,147 @@ class ChiSquaredLikelihood(Likelihood):
             raise ValueError("only exponential link function is supported")
         return torch.distributions.chi2.Chi2(self.link(f)).sample().log()
 
+
+class MultiClassMA(Likelihood):
+    """
+    Multi-Class Multi-Annotator Likelihood
+
+    Modelo de clasificación multiclase con múltiples anotadores de confiabilidad variable.
+
+    Args:
+        K (int): Número de clases
+        R (int): Número de anotadores
+        iAnn (torch.Tensor): Matriz de anotaciones (N, R) donde iAnn[n,m]=1 si
+                             el anotador m etiquetó el dato n
+        Y (torch.Tensor): Etiquetas observadas (N, R) con valores en {1, ..., K} o 0 si no anotado
+
+    Funciones latentes:
+        - f[:,0:K]: funciones de clasificación (softmax)
+        - f[:,K:K+R]: funciones de confiabilidad de anotadores (sigmoid)
+
+    Total: K + R funciones latentes
+    """
+
+    def __init__(self, K, R, iAnn=None, Y=None):
+        super().__init__()
+
+        # Validaciones
+        if K < 2:
+            raise ValueError(f"K debe ser >= 2, got {K}")
+        if R < 1:
+            raise ValueError(f"R debe ser >= 1, got {R}")
+
+        self.K = K  # Número de clases
+        self.R = R  # Número de anotadores
+
+        # Total de funciones latentes: K para clasificación + R para anotadores
+        self.latent_dims = K + R
+
+        # Metadata de anotaciones
+        if iAnn is not None:
+            if not isinstance(iAnn, torch.Tensor):
+                iAnn = torch.tensor(iAnn, dtype=torch.float32)
+            self.iAnn = iAnn  # (N, R)
+        else:
+            self.iAnn = None
+
+        # Etiquetas observadas
+        if Y is not None:
+            if not isinstance(Y, torch.Tensor):
+                Y = torch.tensor(Y, dtype=torch.float32)
+            self.Y = Y  # (N, R)
+        else:
+            self.Y = None
+
+        # No tiene forma cerrada - requiere cuadratura
+        self.has_closed_form = False
+
+        # Parámetros para cuadratura Gauss-Hermite
+        self.gh_degree = 12  # Por defecto, ajustable
+        self._gh_points = None  # Se calculan lazy
+
+    def name(self):
+        return f"MultiClassMA(K={self.K}, R={self.R})"
+
+    def __repr__(self):
+        return f"MultiClassMA(K={self.K}, R={self.R}, latent_dims={self.latent_dims})"
+
+    def validate_y(self, X, y):
+        """
+        Valida las observaciones.
+
+        En MultiClassMA, las observaciones verdaderas (Y, iAnn) se pasan en el constructor.
+        El 'y' que viene de mogptk es solo para validar dimensiones.
+
+        Args:
+            X: inputs, shape (N, input_dims) - ya procesado por MultiLatentLikelihood
+            y: placeholder, shape (N, 1)
+        """
+        # 1. Validar shape básico
+        if y.ndim != 2 or y.shape[1] != 1:
+            raise ValueError(f"y debe tener shape (N, 1), got {y.shape}")
+
+        N = y.shape[0]
+
+        # 2. Verificar que tenemos metadata
+        if self.Y is None or self.iAnn is None:
+            raise ValueError(
+                "MultiClassMA requiere metadata. Usa set_metadata(iAnn, Y) "
+                "o pasa iAnn y Y en el constructor."
+            )
+
+        # 3. Validar dimensiones de metadata
+        if self.Y.shape[0] != N:
+            raise ValueError(
+                f"Y debe tener {N} filas (igual que y), got {self.Y.shape[0]}"
+            )
+
+        if self.iAnn.shape[0] != N:
+            raise ValueError(
+                f"iAnn debe tener {N} filas (igual que y), got {self.iAnn.shape[0]}"
+            )
+
+        if self.Y.shape[1] != self.R or self.iAnn.shape[1] != self.R:
+            raise ValueError(
+                f"Y e iAnn deben tener {self.R} columnas (R anotadores), "
+                f"got Y: {self.Y.shape[1]}, iAnn: {self.iAnn.shape[1]}"
+            )
+
+        # 4. Validar rango de etiquetas (solo donde hay anotaciones)
+        mask = self.iAnn > 0  # Máscara de anotaciones presentes
+        Y_annotated = self.Y[mask]  # Solo etiquetas anotadas
+
+        if Y_annotated.numel() > 0:
+            y_min = Y_annotated.min().item()
+            y_max = Y_annotated.max().item()
+
+            if y_min < 1 or y_max > self.K:
+                raise ValueError(
+                    f"Las etiquetas deben estar en {{1, ..., {self.K}}}, "
+                    f"got min={y_min}, max={y_max}"
+                )
+
+        # 5. Validar consistencia entre Y e iAnn
+        # Donde iAnn=0, Y debería ser 0 (o ignorarse)
+        inconsistent = (self.iAnn == 0) & (self.Y != 0)
+        if inconsistent.any():
+            n_inconsistent = inconsistent.sum().item()
+            raise ValueError(
+                f"Encontradas {n_inconsistent} etiquetas donde iAnn=0 pero Y!=0. "
+                "Y debe ser 0 donde no hay anotaciones."
+            )
+
+        # 6. Verificar que hay al menos una anotación
+        if self.iAnn.sum() == 0:
+            raise ValueError("iAnn está vacío - no hay anotaciones")
+
+        # 7. Opcional: advertir si algún dato no tiene anotaciones
+        annotations_per_point = self.iAnn.sum(dim=1)
+        points_without_annotations = (annotations_per_point == 0).sum().item()
+
+        if points_without_annotations > 0:
+            import warnings
+            warnings.warn(
+                f"{points_without_annotations}/{N} puntos no tienen anotaciones. "
+                "El modelo no aprenderá de estos puntos."
+            )

@@ -44,7 +44,7 @@ def get_model(name, data_points, input_dims, output_dims, Q=1, inference=mogptk.
     #mean = mogptk.MultiOutputMean(mogptk.LinearMean(input_dims=input_dims))
     return mogptk.Model(dataset, kernel, inference=inference)
 
-def train(model, iters, jit=False):
+#def train(model, iters, jit=False):
     #model.train(method='Adam', lr=0.1, iters=iters, jit=jit)
     #return
 

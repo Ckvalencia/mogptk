@@ -11,3 +11,5 @@ examples/experiments
 *.fdb_latexmk
 *.fls
 *.log
+.env
+.venv/

@@ -894,6 +894,7 @@ class Model:
                 ax[j,0].legend(handles=legends[::-1])
         return fig, ax
 
+
     def plot_gram(self, start=None, end=None, n=31, title=None, figsize=(12,12)):
         """
         Plot the gram matrix of associated kernel.
@@ -1067,3 +1068,195 @@ def _format_duration(s):
 
 def _format_time(s):
     return "%3d:%02d:%02d" % (int(s/3600), int((s%3600)/60), int(s%60))
+
+
+def plot_multilatent_prediction(model, X_train, Y_train, X_test, f_true=None,
+                                sigma=2, n=10000, title=None, figsize=None):
+    """
+    Plot predictions for MultiLatentLikelihood models.
+
+    Automatically detects the likelihood type and plots appropriately:
+    - GaussianHeteroLikelihood: heteroscedastic regression
+    - SoftmaxLikelihood: multi-class classification
+
+    Args:
+        model: Trained MOGPTK model with MultiLatentLikelihood
+        X_train: Training data X, shape (n_train, 1)
+        Y_train: Training data Y, shape (n_train, 1)
+        X_test: Prediction points, shape (n_test, 1)
+        f_true: True function (optional), shape (n_train, 1) or callable
+        sigma: Number of standard deviations for confidence intervals
+        n: Number of samples for prediction
+        title: Plot title
+        figsize: Figure size
+
+    Returns:
+        fig: Matplotlib figure
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # Detect likelihood type
+    likelihood_type = None
+    K = None
+
+    if hasattr(model, 'likelihood'):
+        lik = model.likelihood
+
+        # Case 1: MultiLatentLikelihood with inner likelihood
+        if hasattr(lik, 'likelihood'):
+            inner_lik = lik.likelihood
+            inner_name = type(inner_lik).__name__
+
+            if 'Hetero' in inner_name or 'Gaussian' in inner_name:
+                likelihood_type = 'heteroscedastic'
+            elif 'Softmax' in inner_name or 'Categorical' in inner_name:
+                likelihood_type = 'softmax'
+                K = lik.latent_dims if hasattr(lik, 'latent_dims') else len(model.dataset.channels)
+
+        # Case 2: Detect directly by likelihood name
+        if likelihood_type is None:
+            outer_name = type(lik).__name__
+
+            if 'Hetero' in outer_name:
+                likelihood_type = 'heteroscedastic'
+            elif 'Softmax' in outer_name or 'Categorical' in outer_name:
+                likelihood_type = 'softmax'
+                K = lik.latent_dims if hasattr(lik, 'latent_dims') else len(model.dataset.channels)
+
+        # Case 3: Detect by number of latent_dims
+        if likelihood_type is None and hasattr(lik, 'latent_dims'):
+            n_latents = lik.latent_dims
+
+            if n_latents == 2:
+                likelihood_type = 'heteroscedastic'
+            elif n_latents > 2:
+                likelihood_type = 'softmax'
+                K = n_latents
+
+    # Case 4: Fallback - detect by number of channels
+    if likelihood_type is None:
+        n_channels = len(model.dataset.channels)
+
+        if n_channels == 2:
+            likelihood_type = 'heteroscedastic'
+        elif n_channels > 2:
+            likelihood_type = 'softmax'
+            K = n_channels
+
+    if likelihood_type is None:
+        raise ValueError(
+            "Could not detect likelihood type.\n"
+            f"Found {len(model.dataset.channels)} channels."
+        )
+
+    print(f"Detected: {likelihood_type}" + (f" with K={K} classes" if K else ""))
+
+    # Make prediction
+    X_pred, Mu_pred, Lower_pred, Upper_pred = model.predict(X_test, sigma=sigma, n=n)
+
+    # Convert tensors to numpy if necessary
+    if hasattr(X_train, 'numpy'):
+        X_train = X_train.numpy()
+    if hasattr(Y_train, 'numpy'):
+        Y_train = Y_train.numpy()
+    if hasattr(X_test, 'numpy'):
+        X_test = X_test.numpy()
+
+    X_train = X_train.flatten()
+    Y_train = Y_train.flatten()
+    X_test_flat = X_test.flatten()
+
+    # HETEROSCEDASTIC PLOT
+    if likelihood_type == 'heteroscedastic':
+        if figsize is None:
+            figsize = (12, 5)
+
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+        # Predictive mean (channel 0)
+        pY = Mu_pred[0].flatten()
+
+        # Predictive variance (from channel 1: log-variance)
+        log_var = Mu_pred[1].flatten()
+        pYv = np.exp(log_var)
+
+        # Confidence intervals
+        lower = Lower_pred[0].flatten()
+        upper = Upper_pred[0].flatten()
+
+        # Sort by X
+        sort_idx = np.argsort(X_test_flat)
+        X_sorted = X_test_flat[sort_idx]
+        pY_sorted = pY[sort_idx]
+        lower_sorted = lower[sort_idx]
+        upper_sorted = upper[sort_idx]
+
+        # Plot
+        ax.scatter(X_train, Y_train, c='blue', alpha=0.3, s=50, label='Observations')
+        ax.plot(X_sorted, pY_sorted, 'r-', linewidth=2, label='Prediction')
+
+        if f_true is not None:
+            if callable(f_true):
+                f_vals = f_true(X_train)
+            else:
+                f_vals = f_true.flatten() if hasattr(f_true, 'flatten') else f_true
+            ax.plot(X_train, f_vals, 'black', linewidth=2, label=r'True $f(x)$')
+
+        ax.fill_between(
+            X_sorted,
+            lower_sorted,
+            upper_sorted,
+            color='gray',
+            alpha=0.3,
+            label=f'±{sigma}σ predicted'
+        )
+
+        ax.set_xlabel('x', fontsize=12)
+        ax.set_ylabel('y', fontsize=12)
+        ax.legend(fontsize=10)
+        ax.set_title(title or 'Heteroscedastic Regression Prediction', fontsize=14)
+        ax.grid(True, alpha=0.3)
+
+    # SOFTMAX PLOT
+    elif likelihood_type == 'softmax':
+        if figsize is None:
+            figsize = (10, 6)
+
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+        # Get sorting indices once
+        X_pred_flat = X_pred[0].flatten()
+        sort_idx = np.argsort(X_pred_flat)
+        X_sorted = X_pred_flat[sort_idx]
+
+        # Plot each class
+        for k in range(K):
+            prob_k = Mu_pred[k].flatten()
+            lower_k = Lower_pred[k].flatten()
+            upper_k = Upper_pred[k].flatten()
+
+            # Sort each array by X
+            prob_k_sorted = prob_k[sort_idx]
+            lower_k_sorted = lower_k[sort_idx]
+            upper_k_sorted = upper_k[sort_idx]
+
+            # Main line
+            line, = ax.plot(X_sorted, prob_k_sorted, linewidth=2, alpha=1, label=f'Class {k}')
+            color = line.get_color()
+
+            # Confidence interval
+            ax.fill_between(X_sorted, lower_k_sorted, upper_k_sorted, alpha=0.25, color=color)
+
+        ax.set_xlabel('x', fontsize=12)
+        ax.set_ylabel('Probability', fontsize=12)
+        ax.set_ylim(0, 1)
+        ax.set_xlim(X_sorted.min(), X_sorted.max())
+        ax.legend(fontsize=10, loc='best')
+        ax.set_title(title or f'Multi-class Classification ({K} classes)', fontsize=14)
+        ax.grid(False)
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig
