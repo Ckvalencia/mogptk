@@ -2,6 +2,8 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from . import config, Parameter
+#from __future__ import annotations
+from typing import Optional, Union
 
 def identity(x):
     """
@@ -321,7 +323,7 @@ class MultiLatentLikelihood(Likelihood):
             f[:,0] -> mean
             f[:,1] -> log variance
     """
-    def __init__(self, likelihood, mc_samples=10):
+    def __init__(self, likelihood, mc_samples=10,  y_full=None):
         super().__init__()
 
         if not issubclass(type(likelihood), Likelihood):
@@ -329,8 +331,8 @@ class MultiLatentLikelihood(Likelihood):
 
         if isinstance(likelihood, MultiOutputLikelihood):
             raise ValueError("MultiLatentLikelihood wraps a single likelihood only")
-
-        self.likelihood = likelihood
+        self.base_likelihood = likelihood
+        self.likelihood = None
         # Obtener latent_dims del likelihood específico
         if not hasattr(likelihood, 'latent_dims'):
             raise ValueError("El likelihood debe definir el atributo 'latent_dims'")
@@ -342,21 +344,56 @@ class MultiLatentLikelihood(Likelihood):
 
         self.has_closed_form = getattr(likelihood, 'has_closed_form', False)
         self.mc_samples = mc_samples
-    def name(self):
-        return f"MultiLatent[{self.likelihood.name()}, Q={self.latent_dims}]"
+        # Optional full labels for special likelihoods (e.g., MultiClassMA needs (N,R))
+        self.y_full = y_full  # torch.Tensor or None
 
+    def set_y_full(self, y_full):
+        # y_full should be torch.Tensor with shape (N,R) for MultiClassMA
+        self.y_full = y_full
+
+    def name(self):
+        return f"MultiLatent[{self.base_likelihood.name()}, Q={self.latent_dims}]"
+
+    def _unstack_X_and_N(self, X):
+        total_points = X.shape[0]
+        Q = self.latent_dims
+        if total_points % Q != 0:
+            raise ValueError(f"X has {total_points} rows but latent_dims Q={Q} does not divide it.")
+        N = total_points // Q
+        X_unstacked = X[:N, :]
+        return X_unstacked, N
+    
     def validate_y(self, X, y):
         """
         Validate observations.
+
+        Mogptk typically stacks X,y as:
+        X: (N*Q, D)
+        y: (N*Q, 1)
+
+        We validate using only the first block (N,*) because that corresponds to the real datapoints.
+        If self.y_full is provided (e.g. (N,R) for MultiClassMA), validate against that instead.
         """
-        # Calcular N (número de puntos reales)
         total_points = X.shape[0]
-        N = total_points // self.latent_dims
+        Q = self.latent_dims
+        if total_points % Q != 0:
+            raise ValueError(f"X has {total_points} rows but latent_dims Q={Q} does not divide it.")
+        N = total_points // Q
 
-        # Solo validar los primeros N puntos
+        # Use unstacked X (first block)
+        X_unstacked, N = self._unstack_X_and_N(X)
+        X_real = X[:N, :]
+
+        # If provided, use full labels (e.g., multi-annotator)
+        if getattr(self, "y_full", None) is not None:
+            self.base_likelihood.validate_y(X_unstacked, self.y_full)
+            return
+
         y_real = y[:N, :]
-        self.likelihood.validate_y(X, y_real)
+        self.base_likelihood.validate_y(X_unstacked, y_real)
 
+    
+    
     def _reshape_mogptk_to_latent(self, X, tensor):
         """
         Convierte de formato mogptk (N*Q, 1) a formato latent (N, Q)
@@ -393,78 +430,48 @@ class MultiLatentLikelihood(Likelihood):
         return tensor_flat
 
     def log_prob(self, X, y, f):
-        """
-        Args:
-            X : inputs
-            y : observations, shape (N, 1)
-            f : latent functions, shape (N*Q, 1)
+        X_unstacked, N = self._unstack_X_and_N(X)
 
-        Returns:
-            log p(y | f1, ..., fQ)
-        """
-       # if f.ndim != 2:
-       #     raise ValueError("f must be a 2D tensor (N, Q)")
-
-        #if f.shape[1] != self.latent_dims:
-        #   raise ValueError(
-        #        f"Expected {self.latent_dims} latent functions, got {f.shape[1]}"
-        #    )
-        # Convertir f de (N*Q, 1) a (N, Q)
+        # f: (N*Q, 1) -> (N, Q)
         f_reshaped = self._reshape_mogptk_to_latent(X, f)
 
-        # Obtener y real (solo primer canal)
-        r = self._channel_indices(X)
-        y_real = y[r[0], :]
+        # y: prefer y_full if provided
+        if getattr(self, "y_full", None) is not None:
+            y_used = self.y_full
+        else:
+            # fallback: first block of stacked y
+            y_used = y[:N, :]
 
-        # Calcular log_prob - resultado es (N,) o (N, 1)
-        logp = self.likelihood.log_prob(X, y_real, f_reshaped)
+        logp = self.base_likelihood.log_prob(X_unstacked, y_used, f_reshaped)
 
-        if logp.ndim == 1:
-            logp = logp.unsqueeze(-1)
-
-        # Convertir de (N, 1) a (N*Q, 1) - replicar para todos los canales
-        return self._reshape_latent_to_mogptk(X, logp.squeeze(-1))
+        # mogptk expects (N*Q, 1); replicate/stack back
+        if logp.ndim == 2 and logp.shape[1] == 1:
+            logp = logp.squeeze(-1)  # (N,)
+        return self._reshape_latent_to_mogptk(X, logp)
 
     def variational_expectation(self, X, y, mu, var):
-        """
-        Args:
-            X : inputs, shape (N*Q, input_dims)
-            y : observations, shape (N*Q, 1)
-            mu : mean, shape (N*Q, 1)
-            var : variance, shape (N*Q, 1)
+        X_unstacked, N = self._unstack_X_and_N(X)
 
-        Returns:
-            scalar: E_q[log p(y | f)]
-        """
+        mu_reshaped = self._reshape_mogptk_to_latent(X, mu)   # (N,Q)
+        var_reshaped = self._reshape_mogptk_to_latent(X, var) # (N,Q)
 
-
-        # Convertir de (N*Q, 1) a (N, Q)
-        mu_reshaped = self._reshape_mogptk_to_latent(X, mu)
-        var_reshaped = self._reshape_mogptk_to_latent(X, var)
-
-        # Obtener y real (primeros N puntos)
-        N = mu_reshaped.shape[0]
-        Q = self.latent_dims
-        y_real = y[:N, :]
-
+        if getattr(self, "y_full", None) is not None:
+            y_used = self.y_full
+        else:
+            y_used = y[:N, :]
 
         if self.has_closed_form:
-            return self.likelihood.variational_expectation(X, y_real, mu_reshaped, var_reshaped )
+            return self.base_likelihood.variational_expectation(X_unstacked, y_used, mu_reshaped, var_reshaped)
 
         S = self.mc_samples
-
-        # Reparametrización
-        eps = torch.randn(S, N, Q, device=mu_reshaped.device, dtype=mu_reshaped.dtype)
-
+        eps = torch.randn(S, N, self.latent_dims, device=mu_reshaped.device, dtype=mu_reshaped.dtype)
         f_samples = mu_reshaped.unsqueeze(0) + eps * torch.sqrt(var_reshaped).unsqueeze(0)
 
-        # Calcular log p(y | f) para cada muestra
         logp_sum = 0.0
         for s in range(S):
-            logp_s = self.likelihood.log_prob(X, y_real, f_samples[s])
+            logp_s = self.base_likelihood.log_prob(X_unstacked, y_used, f_samples[s])
             logp_sum += logp_s.sum()
 
-        # Promedio Monte Carlo
         return logp_sum / S
 
     def conditional_mean(self, X, f):
@@ -499,7 +506,7 @@ class MultiLatentLikelihood(Likelihood):
             f_reshaped = f_col_flat.reshape(Q, N).T  # (N, Q)
 
             # Llamar likelihood interno
-            mean_col = self.likelihood.conditional_mean(X, f_reshaped)  # (N, 1)
+            mean_col = self.base_likelihood.conditional_mean(X, f_reshaped)  # (N, 1)
 
             # Reshape de vuelta: (N, 1) -> (N*Q, 1)
             mean_col_flat = mean_col.squeeze(-1)  # (N,)
@@ -544,7 +551,7 @@ class MultiLatentLikelihood(Likelihood):
             f_reshaped = f_col_flat.reshape(Q, N).T  # (N, Q)
 
             # Llamar likelihood interno
-            sample_col = self.likelihood.conditional_sample(X, f_reshaped)  # (N, 1)
+            sample_col = self.base_likelihood.conditional_sample(X, f_reshaped)  # (N, 1)
 
             # Reshape de vuelta: (N, 1) -> (N*Q, 1)
             sample_col_flat = sample_col.squeeze(-1)  # (N,)
@@ -582,7 +589,7 @@ class MultiLatentLikelihood(Likelihood):
         var_reshaped = self._reshape_mogptk_to_latent(X, var)
 
         # Llamar al método predict del likelihood interno
-        result = self.likelihood.predict(X, mu_reshaped, var_reshaped, ci=ci, sigma=sigma, n=n)
+        result = self.base_likelihood.predict(X, mu_reshaped, var_reshaped, ci=ci, sigma=sigma, n=n)
 
         # Manejar diferentes formatos de retorno
         if isinstance(result, tuple):
@@ -1558,147 +1565,296 @@ class ChiSquaredLikelihood(Likelihood):
             raise ValueError("only exponential link function is supported")
         return torch.distributions.chi2.Chi2(self.link(f)).sample().log()
 
-
 class MultiClassMA(Likelihood):
     """
-    Multi-Class Multi-Annotator Likelihood
+    Latent functions (per input x):
+      - f[:, :K]     : class logits -> softmax -> zeta (true class probs)
+      - f[:, K:K+R]  : annotator reliability logits -> sigmoid -> z (gate)
 
-    Modelo de clasificación multiclase con múltiples anotadores de confiabilidad variable.
+    Likelihood idea (per labeled entry):
+      p(y_{n,r} | f_n, g_{n,r}) = z_{n,r} * zeta_{n, y_{n,r}} + (1-z_{n,r})*(1/K)
+      (or robust GCE variant controlled by beta).
 
-    Args:
-        K (int): Número de clases
-        R (int): Número de anotadores
-        iAnn (torch.Tensor): Matriz de anotaciones (N, R) donde iAnn[n,m]=1 si
-                             el anotador m etiquetó el dato n
-        Y (torch.Tensor): Etiquetas observadas (N, R) con valores en {1, ..., K} o 0 si no anotado
-
-    Funciones latentes:
-        - f[:,0:K]: funciones de clasificación (softmax)
-        - f[:,K:K+R]: funciones de confiabilidad de anotadores (sigmoid)
-
-    Total: K + R funciones latentes
+    Parameters
+    ----------
+    K : int
+        Number of classes.
+    R : int
+        Number of annotators.
+    iAnn : array-like, optional
+        Annotation mask of shape (N, R), binary {0,1}. If not passed here, must be set
+        later before training (e.g., with set_iAnn()).
+    beta : float, default=0.1
+        Robustness parameter (as in demo: multiClassMA_GCE(K, R, 0.1)).
+    use_gce : bool, default=True
+        Whether to use generalized cross-entropy objective variant.
+        (You can start with False to debug standard CE, but for demo fidelity keep True.)
+    eps : float, default=1e-9
+        Numerical stability clamp.
+    require_every_point_labeled_at_least_once : bool, default=True
+        Demo intent: every point should have at least one label (enforced in validate_y).
     """
 
-    def __init__(self, K, R, iAnn=None, Y=None):
+    ArrayLike = Union[torch.Tensor, np.ndarray]
+
+    def __init__(
+        self,
+        K: int,
+        R: int,
+        iAnn: Optional[ArrayLike] = None,
+        beta: float = 0.1,
+        use_gce: bool = True,
+        eps: float = 1e-9,
+        require_every_point_labeled_at_least_once: bool = True,
+    ):
         super().__init__()
 
-        # Validaciones
-        if K < 2:
-            raise ValueError(f"K debe ser >= 2, got {K}")
-        if R < 1:
-            raise ValueError(f"R debe ser >= 1, got {R}")
+        # ---- basic checks ----
+        if not isinstance(K, int) or K < 2:
+            raise ValueError(f"K must be an int >= 2, got {K!r}")
+        if not isinstance(R, int) or R < 1:
+            raise ValueError(f"R must be an int >= 1, got {R!r}")
+        if beta <= 0:
+            raise ValueError(f"beta must be > 0, got {beta!r}")
+        if eps <= 0:
+            raise ValueError(f"eps must be > 0, got {eps!r}")
 
-        self.K = K  # Número de clases
-        self.R = R  # Número de anotadores
+        self.K = K
+        self.R = R
 
-        # Total de funciones latentes: K para clasificación + R para anotadores
+        #self.rel_bias = torch.nn.Parameter(torch.zeros(R))
+
+        # --- compat con mogptk parameter listing ---
+        #self.rel_bias._name = "MultiClassMA.rel_bias"   # mogptk imprime p._name
+        #self.rel_bias.train = True                      # mogptk cuenta si p.train
+        #self.rel_bias.num_parameters = self.rel_bias.numel()  # mogptk suma p.num_parameters
+        # Total latent functions (demo: L = K + R)
         self.latent_dims = K + R
 
-        # Metadata de anotaciones
-        if iAnn is not None:
-            if not isinstance(iAnn, torch.Tensor):
-                iAnn = torch.tensor(iAnn, dtype=torch.float32)
-            self.iAnn = iAnn  # (N, R)
-        else:
-            self.iAnn = None
-
-        # Etiquetas observadas
-        if Y is not None:
-            if not isinstance(Y, torch.Tensor):
-                Y = torch.tensor(Y, dtype=torch.float32)
-            self.Y = Y  # (N, R)
-        else:
-            self.Y = None
-
-        # No tiene forma cerrada - requiere cuadratura
+        # mogptk wrapper flags
         self.has_closed_form = False
 
-        # Parámetros para cuadratura Gauss-Hermite
-        self.gh_degree = 12  # Por defecto, ajustable
-        self._gh_points = None  # Se calculan lazy
+        # robust loss config
+        self.beta = float(beta)
+        self.use_gce = bool(use_gce)
+        self.eps = float(eps)
 
-    def name(self):
-        return f"MultiClassMA(K={self.K}, R={self.R})"
+        # validation policy (demo-style)
+        self.require_every_point_labeled_at_least_once = bool(
+            require_every_point_labeled_at_least_once
+        )
 
-    def __repr__(self):
-        return f"MultiClassMA(K={self.K}, R={self.R}, latent_dims={self.latent_dims})"
+        # store annotation mask (metadata)
+        self.iAnn: Optional[torch.Tensor] = None
+        if iAnn is not None:
+            self.set_iAnn(iAnn)
 
-    def validate_y(self, X, y):
+    def name(self) -> str:
+        return f"MultiClassMA(beta={self.beta}, K={self.K}, R={self.R}, Q={self.latent_dims})"
+
+    def set_iAnn(self, iAnn: ArrayLike) -> None:
         """
-        Valida las observaciones.
+        Set annotation mask. Shape expected: (N, R). Values expected: 0/1.
 
-        En MultiClassMA, las observaciones verdaderas (Y, iAnn) se pasan en el constructor.
-        El 'y' que viene de mogptk es solo para validar dimensiones.
-
-        Args:
-            X: inputs, shape (N, input_dims) - ya procesado por MultiLatentLikelihood
-            y: placeholder, shape (N, 1)
+        Note: We cannot fully validate N here because N is only known when y/X are given.
+        We do validate: tensor type, ndim=2, and second dim equals R.
         """
-        # 1. Validar shape básico
-        if y.ndim != 2 or y.shape[1] != 1:
-            raise ValueError(f"y debe tener shape (N, 1), got {y.shape}")
+        if isinstance(iAnn, np.ndarray):
+            iAnn_t = torch.from_numpy(iAnn)
+        elif isinstance(iAnn, torch.Tensor):
+            iAnn_t = iAnn
+        else:
+            raise ValueError(f"iAnn must be a torch.Tensor or np.ndarray, got {type(iAnn)}")
 
-        N = y.shape[0]
-
-        # 2. Verificar que tenemos metadata
-        if self.Y is None or self.iAnn is None:
+        if iAnn_t.ndim != 2:
+            raise ValueError(f"iAnn must be 2D (N, R), got shape {tuple(iAnn_t.shape)}")
+        if iAnn_t.shape[1] != self.R:
             raise ValueError(
-                "MultiClassMA requiere metadata. Usa set_metadata(iAnn, Y) "
-                "o pasa iAnn y Y en el constructor."
+                f"iAnn must have R={self.R} columns, got {tuple(iAnn_t.shape)}"
             )
 
-        # 3. Validar dimensiones de metadata
-        if self.Y.shape[0] != N:
-            raise ValueError(
-                f"Y debe tener {N} filas (igual que y), got {self.Y.shape[0]}"
+        # Keep as float for downstream multiplications (common in torch code)
+        if not torch.is_floating_point(iAnn_t):
+            iAnn_t = iAnn_t.to(torch.float32)
+
+        self.iAnn = iAnn_t
+
+
+    def validate_y(self, X: torch.Tensor, y: torch.Tensor) -> None:
+        """
+        Validate observations (demo-style).
+
+        Expected (as in utils.multiple_annotators):
+          - X: (N, 1) (we only use N here; warn if not 1D)
+          - y: (N, R) with class ids in {1..K} for ALL entries (even where iAnn=0)
+          - self.iAnn: (N, R) binary mask indicating which annotator labeled which point
+
+        Additionally (demo intent): every point must be labeled at least once.
+        """
+        import warnings
+        import torch
+
+        # ---- basic X checks (only to get N) ----
+        if not isinstance(X, torch.Tensor):
+            raise ValueError(f"X must be a torch.Tensor, got {type(X)}")
+        if X.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape {tuple(X.shape)}")
+
+        N = X.shape[0]
+        if N <= 0:
+            raise ValueError("X has zero rows (N=0)")
+
+        # Demo is 1D; don't hard-fail if D != 1
+        if X.shape[1] != 1:
+            warnings.warn(
+                f"[MultiClassMA.validate_y] Demo is 1D but X has D={X.shape[1]} columns."
             )
 
-        if self.iAnn.shape[0] != N:
+        # ---- y checks ----
+        if not isinstance(y, torch.Tensor):
+            raise ValueError(f"y must be a torch.Tensor, got {type(y)}")
+        if y.ndim != 2:
+            raise ValueError(f"y must be 2D (N, R), got shape {tuple(y.shape)}")
+        if y.shape[0] != N:
+            raise ValueError(f"N mismatch: X has N={N} rows but y has {y.shape[0]} rows")
+        if y.shape[1] != self.R:
             raise ValueError(
-                f"iAnn debe tener {N} filas (igual que y), got {self.iAnn.shape[0]}"
+                f"y must have R={self.R} columns (annotators). Got {tuple(y.shape)}"
             )
 
-        if self.Y.shape[1] != self.R or self.iAnn.shape[1] != self.R:
+        # In the demo, y is always in {1..K} even where iAnn=0
+        y_min = float(y.min().item())
+        y_max = float(y.max().item())
+        if y_min < 1 or y_max > self.K:
             raise ValueError(
-                f"Y e iAnn deben tener {self.R} columnas (R anotadores), "
-                f"got Y: {self.Y.shape[1]}, iAnn: {self.iAnn.shape[1]}"
+                f"Labels in y must be in [1..K] as in demo. "
+                f"K={self.K}, but y has min={y_min}, max={y_max}."
             )
 
-        # 4. Validar rango de etiquetas (solo donde hay anotaciones)
-        mask = self.iAnn > 0  # Máscara de anotaciones presentes
-        Y_annotated = self.Y[mask]  # Solo etiquetas anotadas
-
-        if Y_annotated.numel() > 0:
-            y_min = Y_annotated.min().item()
-            y_max = Y_annotated.max().item()
-
-            if y_min < 1 or y_max > self.K:
-                raise ValueError(
-                    f"Las etiquetas deben estar en {{1, ..., {self.K}}}, "
-                    f"got min={y_min}, max={y_max}"
+        # If y is float, it should still represent integers (warn only)
+        if torch.is_floating_point(y):
+            max_frac = (y - y.round()).abs().max().item()
+            if max_frac > 1e-6:
+                warnings.warn(
+                    f"[MultiClassMA.validate_y] y is float and not near-integer "
+                    f"(max fractional part={max_frac}). Demo uses float but integer class IDs."
                 )
 
-        # 5. Validar consistencia entre Y e iAnn
-        # Donde iAnn=0, Y debería ser 0 (o ignorarse)
-        inconsistent = (self.iAnn == 0) & (self.Y != 0)
-        if inconsistent.any():
-            n_inconsistent = inconsistent.sum().item()
+        # ---- iAnn checks ----
+        if self.iAnn is None:
             raise ValueError(
-                f"Encontradas {n_inconsistent} etiquetas donde iAnn=0 pero Y!=0. "
-                "Y debe ser 0 donde no hay anotaciones."
+                "MultiClassMA requires iAnn (annotation mask) to be set (demo-style). "
+                "Pass iAnn in __init__ or call set_iAnn(iAnn) before training."
             )
 
-        # 6. Verificar que hay al menos una anotación
-        if self.iAnn.sum() == 0:
-            raise ValueError("iAnn está vacío - no hay anotaciones")
+        iAnn = self.iAnn
+        if not isinstance(iAnn, torch.Tensor):
+            raise ValueError(f"self.iAnn must be a torch.Tensor, got {type(iAnn)}")
+        if iAnn.ndim != 2:
+            raise ValueError(f"iAnn must be 2D (N, R), got shape {tuple(iAnn.shape)}")
+        if tuple(iAnn.shape) != (N, self.R):
+            raise ValueError(
+                f"iAnn must have shape (N,R)=({N},{self.R}), got {tuple(iAnn.shape)}"
+            )
 
-        # 7. Opcional: advertir si algún dato no tiene anotaciones
-        annotations_per_point = self.iAnn.sum(dim=1)
-        points_without_annotations = (annotations_per_point == 0).sum().item()
+        # Binary check (tolerant for float near 0/1)
+        if torch.is_floating_point(iAnn):
+            tol = 1e-6
+            bad = ~(((iAnn - 0).abs() < tol) | ((iAnn - 1).abs() < tol))
+            if bad.any():
+                raise ValueError("iAnn must be binary (0/1). Found non-binary values.")
+        else:
+            bad = ~((iAnn == 0) | (iAnn == 1))
+            if bad.any():
+                raise ValueError("iAnn must be binary (0/1). Found non-binary values.")
 
-        if points_without_annotations > 0:
-            import warnings
+        total_ann = float(iAnn.sum().item())
+        if total_ann <= 0:
+            raise ValueError("iAnn has no annotations (sum == 0).")
+
+        # Demo intent: each point labeled at least once
+        per_point = iAnn.sum(dim=1)
+        n_unlabeled = int((per_point == 0).sum().item())
+        if n_unlabeled > 0:
+            raise ValueError(
+                f"{n_unlabeled}/{N} points have no annotations (row-sum(iAnn)=0)."
+            )
+
+        # Optional warning: annotators with no labels
+        per_annotator = iAnn.sum(dim=0)
+        silent = (per_annotator == 0).nonzero(as_tuple=True)[0].tolist()
+        if len(silent) > 0:
             warnings.warn(
-                f"{points_without_annotations}/{N} puntos no tienen anotaciones. "
-                "El modelo no aprenderá de estos puntos."
+                "[MultiClassMA.validate_y] Some annotators have no labels (column-sum(iAnn)=0): "
+                f"{silent}. Their reliability latents may be weakly identified."
             )
+    
+    def log_prob(self, X: torch.Tensor, y: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+        """
+        Multi-annotator likelihood (mixture with uniform noise gate).
+
+        Args:
+            X: (N, D) inputs (N used)
+            y: (N, R) class ids in {1..K} (float or int)
+            f: (N, Q) where Q = K + R:
+                f[:, :K] -> class logits
+                f[:, K:] -> annotator reliability logits
+
+        Returns:
+            (N,1) per-point log-likelihood (sum over annotators, masked by iAnn).
+        """
+        import torch
+
+        if self.iAnn is None:
+            raise ValueError("MultiClassMA.log_prob requires iAnn to be set.")
+        if f.ndim != 2 or f.shape[1] != self.latent_dims:
+            raise ValueError(f"f must have shape (N,{self.latent_dims}), got {tuple(f.shape)}")
+        if y.ndim != 2 or y.shape[1] != self.R:
+            raise ValueError(f"y must have shape (N,{self.R}), got {tuple(y.shape)}")
+
+        N = f.shape[0]
+        if y.shape[0] != N:
+            raise ValueError(f"N mismatch: f has N={N}, y has N={y.shape[0]}")
+
+        iAnn = self.iAnn.to(device=f.device, dtype=f.dtype)
+        if iAnn.shape != (N, self.R):
+            raise ValueError(f"iAnn must have shape (N,R)=({N},{self.R}), got {tuple(iAnn.shape)}")
+
+        # Latent split
+        class_logits = f[:, : self.K]                   # (N,K)
+        reliab_logits = f[:, self.K : self.K + self.R]  # (N,R)
+        #reliab_logits = f[:, self.K : self.K + self.R] + self.rel_bias  # (N,R)
+        # zeta: (N,K)
+        zeta = torch.softmax(class_logits, dim=1).clamp(min=self.eps, max=1.0)
+
+        # z: (N,R)
+        z = torch.sigmoid(reliab_logits).clamp(min=self.eps, max=1.0 - self.eps)
+
+        # y -> indices 0..K-1
+        if torch.is_floating_point(y):
+            y_idx = (y.round().to(torch.long) - 1)
+        else:
+            y_idx = (y.to(torch.long) - 1)
+        y_idx = y_idx.clamp(min=0, max=self.K - 1)  # (N,R)
+
+        # p_true[n,r] = zeta[n, y_idx[n,r]]
+        n_idx = torch.arange(N, device=f.device).unsqueeze(1).expand(N, self.R)  # (N,R)
+        p_true = zeta[n_idx, y_idx]  # (N,R)
+
+        # Mixture with uniform
+        p = z * p_true + (1.0 - z) * (1.0 / float(self.K))  # (N,R)
+        p = p.clamp(min=self.eps, max=1.0)
+
+        # Per-entry contribution
+        if self.use_gce:
+            beta = torch.tensor(self.beta, device=f.device, dtype=f.dtype)
+            ll_nr = -(1.0 - p.pow(beta)) / beta  # (N,R) robust surrogate
+        else:
+            ll_nr = torch.log(p)  # (N,R) true log-likelihood
+
+        # Mask unlabeled entries
+        ll_nr = ll_nr * iAnn
+
+        # Sum over annotators -> per-point scalar
+        ll_n = ll_nr.sum(dim=1, keepdim=True)  # (N,1)
+        return ll_n
